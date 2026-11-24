@@ -19,6 +19,9 @@ ifeq ($(BOARD_ID),)
 $(error BOARD must be es3c28p or tdeck, got '$(BOARD)')
 endif
 FW := $(BUILD)/fw-$(BOARD)
+# Core and library sources embed __FILE__ paths in the image. Rewrite the home directory to ~ so
+# published images (make dist) don't carry the builder's username.
+PREFIX_MAP := $(if $(HOME),-fmacro-prefix-map=$(HOME)=~)
 
 .PHONY: help setup build build-all check-port flash monitor preview dist clean
 
@@ -37,8 +40,9 @@ setup:
 	arduino-cli lib install "RadioLib@$(RADIOLIB)"
 
 build:
-	arduino-cli compile --fqbn $(FQBN) --warnings default \
-	  --build-property "compiler.cpp.extra_flags=-DDECK_BOARD=$(BOARD_ID)" \
+	arduino-cli compile --fqbn $(FQBN) --warnings default $(COMPILE_OPTS) \
+	  --build-property "compiler.cpp.extra_flags=-DDECK_BOARD=$(BOARD_ID) $(PREFIX_MAP)" \
+	  --build-property "compiler.c.extra_flags=$(PREFIX_MAP)" \
 	  --output-dir $(FW) Cyberdeck
 
 build-all:
@@ -59,7 +63,9 @@ preview:
 	$(CXX) -std=c++17 -O2 -Wall -Wextra -ICyberdeck tools/preview/preview.cpp Cyberdeck/gfx.cpp Cyberdeck/ui.cpp -o $(BUILD)/preview/render
 	$(BUILD)/preview/render $(BUILD)/preview
 
-dist: build
+# --clean: arduino-cli otherwise reuses a cached core.a built without PREFIX_MAP
+dist:
+	$(MAKE) build BOARD=$(BOARD) COMPILE_OPTS=--clean
 	@mkdir -p dist
 	python3 tools/trim_bin.py $(FW)/Cyberdeck.ino.merged.bin dist/cyberdeck-$(BOARD)-0x0.bin
 

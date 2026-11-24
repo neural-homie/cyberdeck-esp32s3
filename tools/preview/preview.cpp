@@ -159,7 +159,7 @@ static void files(UiState& s) {
   s.sdUsedGB = 3.2f; s.sdTotalGB = 29.7f;
 }
 
-struct Scene { const char* name; void (*setup)(UiState&); };
+struct Scene { const char* name; void (*setup)(UiState&); bool touchOnly = false; };
 
 static const Scene SCENES[] = {
   {"home", [](UiState& s) { s.screen = SCR_HOME; }},
@@ -192,8 +192,8 @@ static const Scene SCENES[] = {
   {"tools", [](UiState& s) { s.screen = SCR_TOOLS; }},
   {"files", [](UiState& s) { s.screen = SCR_FILES; files(s); s.fileSel = 4; }},
   {"files_nocard", [](UiState& s) { s.screen = SCR_FILES; s.sdOk = false; }},
-  {"touchcal", [](UiState& s) { s.screen = SCR_TOUCHCAL; s.calStep = 1; s.ms = 300; }},
-  {"touchcal_retry", [](UiState& s) { s.screen = SCR_TOUCHCAL; s.calStep = 0; s.calFailed = true; s.ms = 300; }},
+  {"touchcal", [](UiState& s) { s.screen = SCR_TOUCHCAL; s.calStep = 1; s.ms = 300; }, true},
+  {"touchcal_retry", [](UiState& s) { s.screen = SCR_TOUCHCAL; s.calStep = 0; s.calFailed = true; s.ms = 300; }, true},
 };
 
 // Each scene is rendered once per board profile. The T-Deck keeps the original file names.
@@ -229,11 +229,13 @@ int main(int argc, char** argv) {
   int written = 0;
   for (const Profile& prof : PROFILES) {
     std::vector<uint8_t> sheet((size_t)SW * SH * 3, 18);
+    int cell = 0;                                    // position on this profile's contact sheet
     for (int i = 0; i < n; i++) {
       std::string name = std::string(prof.prefix) + SCENES[i].name;
       if (only && name != only) continue;
       baseline(s);
       prof.apply(s);
+      if (SCENES[i].touchOnly && !s.touchUi) continue;
       SCENES[i].setup(s);
       std::vector<uint8_t> rgb = render(s);
       std::string path = std::string(out) + "/" + name + ".png";
@@ -241,7 +243,8 @@ int main(int argc, char** argv) {
                     SCREEN_W * scale, SCREEN_H * scale)) return 1;
       printf("%s\n", path.c_str());
       written++;
-      int ox = pad + (i % cols) * (SCREEN_W + pad), oy = pad + (i / cols) * (SCREEN_H + pad);
+      int ox = pad + (cell % cols) * (SCREEN_W + pad), oy = pad + (cell / cols) * (SCREEN_H + pad);
+      cell++;
       for (int y = 0; y < SCREEN_H; y++)
         memcpy(&sheet[((size_t)(oy + y) * SW + ox) * 3], &rgb[(size_t)y * SCREEN_W * 3], SCREEN_W * 3);
     }
