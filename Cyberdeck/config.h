@@ -3,6 +3,12 @@
 // ---------------------------------------------------------------------------
 #pragma once
 
+// Hardware target: 1 = LILYGO T-Deck, 2 = LCDWiki 2.8" ES3C28P (see boards.h).
+// `make build BOARD=tdeck|es3c28p` overrides this; the Arduino IDE uses the value here.
+#ifndef DECK_BOARD
+#define DECK_BOARD        2
+#endif
+
 // Title shown on the home screen (keep it to ~16 characters).
 #define DECK_TITLE        "NEOTROPOLIS"
 

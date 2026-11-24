@@ -24,6 +24,11 @@ struct UiState {
   uint32_t ms = 0;               // animation clock
   int menuSel = 0;
 
+  // board capabilities (set once at boot)
+  bool touchUi = false;          // touchscreen: tap/drag hints, "<" back in the header, footer buttons
+  bool hasRadio = true;          // false = no LoRa on this board: COMMS is greyed out
+  const char* boardName = "T-DECK";
+
   // power
   int battPct = 0;
   float battV = 0;
@@ -31,6 +36,7 @@ struct UiState {
   // boot
   BootLine boot[BOOT_LINES];
   int bootCount = 0;
+  int bootTotal = BOOT_LINES;    // steps this board runs, for the progress bar
 
   // system
   char chip[24] = "";
@@ -39,7 +45,7 @@ struct UiState {
   uint32_t heapFree = 0, heapTotal = 0, psramFree = 0, psramTotal = 0;
   uint32_t uptimeS = 0;
   char mac[18] = "";
-  bool radioOk = false, kbOk = false, sdOk = false;
+  bool radioOk = false, inputOk = false, sdOk = false;   // inputOk: keyboard (T-Deck) or touch panel
 
   // scan
   bool scanning = false;
@@ -71,3 +77,9 @@ struct UiState {
 extern const char* const MENU_LABELS[MENU_COUNT];
 
 void drawScreen(Canvas& g, const UiState& s);
+
+// Touch: what is under screen point (x, y) on the current screen. Lives next to the drawing code
+// so layout and hit areas stay in one place. index is absolute (list scroll already applied).
+enum HitKind : uint8_t { HIT_NONE, HIT_BACK, HIT_ITEM, HIT_ACTION };
+struct UiHit { HitKind kind; int index; };
+UiHit uiHitTest(const UiState& s, int x, int y);

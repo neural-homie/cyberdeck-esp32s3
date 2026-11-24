@@ -3,7 +3,8 @@
 // Renders every screen through the SAME drawing code the firmware uses (Cyberdeck/gfx.cpp + ui.cpp)
 // and writes PNGs, so UI changes can be checked without flashing.
 //
-//   make preview                       -> build/preview/<scene>.png (2x) + build/preview/all.png (1x sheet)
+//   make preview                       -> build/preview/<scene>.png (2x) + all.png (1x sheet) for the T-Deck,
+//                                         es3c28p_<scene>.png + all_es3c28p.png for the 2.8" touch board
 //   build/preview/render OUTDIR [--scale N] [--only NAME]
 //
 // To preview a new screen or state: add a scene to SCENES below.
@@ -120,7 +121,7 @@ static void baseline(UiState& s) {
   s = UiState();
   s.title = DECK_TITLE;
   s.battPct = 87; s.battV = 4.02f;
-  s.radioOk = true; s.kbOk = true; s.sdOk = true;
+  s.radioOk = true; s.inputOk = true; s.sdOk = true;
   snprintf(s.callsign, sizeof s.callsign, "DECK-7F3A");
   s.freqMhz = LORA_FREQ_MHZ;
   s.ms = 5200;
@@ -166,10 +167,13 @@ static const Scene SCENES[] = {
   {"home_lowbatt", [](UiState& s) { s.screen = SCR_HOME; s.battPct = 9; s.radioOk = false; s.sdOk = false; }},
   {"boot", [](UiState& s) {
      s.screen = SCR_BOOT; s.ms = 1250;
-     const char* bl[] = {"DISPLAY", "KEYBOARD", "TRACKBALL", "LORA SX1262", "SD CARD", "BATTERY", "SYSTEM"};
-     uint8_t st[] = {1, 1, 1, 1, 3, 0, 0};
-     s.bootCount = 6;
-     for (int i = 0; i < 7; i++) { snprintf(s.boot[i].label, sizeof s.boot[i].label, "%s", bl[i]); s.boot[i].status = st[i]; }
+     const char* tdeck[] = {"DISPLAY", "KEYBOARD", "TRACKBALL", "LORA SX1262", "SD CARD", "BATTERY", "SYSTEM"};
+     const char* touch[] = {"DISPLAY", "TOUCH", "SD CARD", "BATTERY", "SYSTEM"};
+     uint8_t stT[] = {1, 1, 1, 1, 3, 0, 0}, stP[] = {1, 1, 3, 0, 0};
+     const char** bl = s.touchUi ? touch : tdeck;
+     uint8_t* st = s.touchUi ? stP : stT;
+     s.bootCount = s.touchUi ? 4 : 6;
+     for (int i = 0; i < s.bootTotal; i++) { snprintf(s.boot[i].label, sizeof s.boot[i].label, "%s", bl[i]); s.boot[i].status = st[i]; }
    }},
   {"system", [](UiState& s) { s.screen = SCR_SYSTEM; }},
   {"scan", [](UiState& s) { s.screen = SCR_SCAN; nets(s); s.netSel = 1; }},
@@ -188,6 +192,15 @@ static const Scene SCENES[] = {
   {"tools", [](UiState& s) { s.screen = SCR_TOOLS; }},
   {"files", [](UiState& s) { s.screen = SCR_FILES; files(s); s.fileSel = 4; }},
   {"files_nocard", [](UiState& s) { s.screen = SCR_FILES; s.sdOk = false; }},
+};
+
+// Each scene is rendered once per board profile. The T-Deck keeps the original file names.
+struct Profile { const char* prefix; const char* sheet; void (*apply)(UiState&); };
+static const Profile PROFILES[] = {
+  {"", "all.png", [](UiState&) {}},
+  {"es3c28p_", "all_es3c28p.png", [](UiState& s) {
+     s.touchUi = true; s.hasRadio = false; s.radioOk = false; s.boardName = "ES3C28P"; s.bootTotal = 5;
+   }},
 };
 
 int main(int argc, char** argv) {
@@ -209,28 +222,32 @@ int main(int argc, char** argv) {
   const int cols = 3, pad = 8;
   const int rows = (n + cols - 1) / cols;
   const int SW = cols * SCREEN_W + (cols + 1) * pad, SH = rows * SCREEN_H + (rows + 1) * pad;
-  std::vector<uint8_t> sheet((size_t)SW * SH * 3, 18);
 
   static UiState s;
   int written = 0;
-  for (int i = 0; i < n; i++) {
-    if (only && strcmp(only, SCENES[i].name)) continue;
-    baseline(s);
-    SCENES[i].setup(s);
-    std::vector<uint8_t> rgb = render(s);
-    std::string path = std::string(out) + "/" + SCENES[i].name + ".png";
-    if (!writePng(path.c_str(), scale > 1 ? upscale(rgb, SCREEN_W, SCREEN_H, scale) : rgb,
-                  SCREEN_W * scale, SCREEN_H * scale)) return 1;
-    printf("%s\n", path.c_str());
-    written++;
-    int ox = pad + (i % cols) * (SCREEN_W + pad), oy = pad + (i / cols) * (SCREEN_H + pad);
-    for (int y = 0; y < SCREEN_H; y++)
-      memcpy(&sheet[((size_t)(oy + y) * SW + ox) * 3], &rgb[(size_t)y * SCREEN_W * 3], SCREEN_W * 3);
-  }
-  if (!only) {
-    std::string path = std::string(out) + "/all.png";
-    if (!writePng(path.c_str(), sheet, SW, SH)) return 1;
-    printf("%s\n", path.c_str());
+  for (const Profile& prof : PROFILES) {
+    std::vector<uint8_t> sheet((size_t)SW * SH * 3, 18);
+    for (int i = 0; i < n; i++) {
+      std::string name = std::string(prof.prefix) + SCENES[i].name;
+      if (only && name != only) continue;
+      baseline(s);
+      prof.apply(s);
+      SCENES[i].setup(s);
+      std::vector<uint8_t> rgb = render(s);
+      std::string path = std::string(out) + "/" + name + ".png";
+      if (!writePng(path.c_str(), scale > 1 ? upscale(rgb, SCREEN_W, SCREEN_H, scale) : rgb,
+                    SCREEN_W * scale, SCREEN_H * scale)) return 1;
+      printf("%s\n", path.c_str());
+      written++;
+      int ox = pad + (i % cols) * (SCREEN_W + pad), oy = pad + (i / cols) * (SCREEN_H + pad);
+      for (int y = 0; y < SCREEN_H; y++)
+        memcpy(&sheet[((size_t)(oy + y) * SW + ox) * 3], &rgb[(size_t)y * SCREEN_W * 3], SCREEN_W * 3);
+    }
+    if (!only) {
+      std::string path = std::string(out) + "/" + prof.sheet;
+      if (!writePng(path.c_str(), sheet, SW, SH)) return 1;
+      printf("%s\n", path.c_str());
+    }
   }
   if (only && !written) { fprintf(stderr, "no scene named %s\n", only); return 1; }
   return 0;

@@ -1,57 +1,55 @@
 // ===========================================================================
-//  CYBERDECK firmware for the LILYGO T-Deck / T-Deck Plus (ESP32-S3)
+//  CYBERDECK firmware for ESP32-S3 handhelds
+//    - LILYGO T-Deck / T-Deck Plus (keyboard, trackball, LoRa)
+//    - LCDWiki 2.8" ES3C28P touch display (touchscreen, BOOT key, no radio)
+//  Pick the board in config.h or with `make build BOARD=...`; pins are in boards.h.
 //
 //  Board:  ESP32S3 Dev Module, USB CDC On Boot: Enabled,
 //          Flash Size: 16MB, PSRAM: OPI PSRAM, Partition: 16M Flash (3MB APP/9.9MB FATFS)
-//  Library: RadioLib (Library Manager)
+//  Library: RadioLib (Library Manager, T-Deck only)
 //
-//  Controls
+//  Controls (T-Deck)
 //    Trackball up/down ... move          Trackball click / Enter ... select
 //    Trackball left ...... back          Backspace ................ back
 //    COMMS: type on the keyboard, Enter sends over LoRa
+//  Controls (touch boards)
+//    Tap an item to open it, drag lists to scroll, tap the "<" title or swipe right to go back.
+//    BOOT key also goes back.
 // ===========================================================================
 #include <Arduino.h>
 #include <algorithm>
 #include <SPI.h>
 #include <Wire.h>
 #include <WiFi.h>
-#include <SD.h>
 #include <Preferences.h>
-#include <RadioLib.h>
 #include "config.h"
+#include "boards.h"
+#if SD_OVER_SPI
+#include <SD.h>
+#define SDCARD SD
+#else
+#include <SD_MMC.h>
+#define SDCARD SD_MMC
+#endif
+#if HAS_LORA
+#include <RadioLib.h>
+#endif
 #include "gfx.h"
 #include "ui.h"
 
-// ---- T-Deck pin map (from LilyGO's utilities.h) ----------------------------
-#define PIN_POWER_ON    10   // must be HIGH to power keyboard, radio, display
-#define PIN_I2C_SDA     18
-#define PIN_I2C_SCL      8
-#define PIN_BAT_ADC      4
-#define PIN_SPI_SCK     40
-#define PIN_SPI_MOSI    41
-#define PIN_SPI_MISO    38
-#define PIN_TFT_CS      12
-#define PIN_TFT_DC      11
-#define PIN_TFT_BL      42
-#define PIN_SD_CS       39
-#define PIN_RADIO_CS     9
-#define PIN_RADIO_BUSY  13
-#define PIN_RADIO_RST   17
-#define PIN_RADIO_DIO1  45
-#define PIN_BALL_RIGHT   2
-#define PIN_BALL_UP      3
-#define PIN_BALL_LEFT    1
-#define PIN_BALL_DOWN   15
-#define PIN_BALL_CLICK   0
-#define KEYBOARD_ADDR 0x55
-
-// ---- globals ---------------------------------------------------------------
+// ---- types used in function signatures (must precede the first function) ---
 enum Ev { EV_UP, EV_DOWN, EV_LEFT, EV_RIGHT, EV_CLICK, EV_KEY };
 static void handle(Ev e, char key = 0);
+
+#if HAS_TOUCH
+enum TouchKind : uint8_t { TE_TAP, TE_STEP, TE_BACK, TE_BUTTON };
+struct TouchEv { TouchKind kind; int16_t x, y, rawX, rawY; };   // TE_STEP: x = +1 (down) / -1 (up)
+#endif
 
 // Serial log for bring-up (115200, `make monitor`). Skipped when no USB host is listening.
 #define LOG(...) do { if (Serial) Serial.printf(__VA_ARGS__); } while (0)
 
+// ---- globals ---------------------------------------------------------------
 static UiState S;
 static uint16_t* fb = nullptr;
 static uint8_t lineBuf[SCREEN_W * 2];
@@ -59,15 +57,17 @@ static bool dirty = true;
 static uint32_t lastFrame = 0;
 static uint32_t drawUs = 0, pushUs = 0;   // last frame timings, for the [stat] log
 static uint32_t battRawMv = 0;            // ADC pin mV before the x2 divider correction
-static int radioErr = 0;                  // RadioLib begin() result
+static int radioErr = 0;                  // RadioLib begin() result (0 on boards without a radio)
 static Preferences prefs;
 
+#if HAS_LORA
 SX1262 radio = new Module(PIN_RADIO_CS, PIN_RADIO_DIO1, PIN_RADIO_RST, PIN_RADIO_BUSY, SPI);
 static volatile bool radioFlag = false;
 static void IRAM_ATTR onRadio() { radioFlag = true; }
+#endif
 
 // ===========================================================================
-//  Display: ST7789 320x240 on the shared SPI bus
+//  Display: 320x240 landscape over SPI (ST7789 on the T-Deck, ILI9341V on the ES3C28P)
 // ===========================================================================
 static SPISettings tftSPI(40000000, MSBFIRST, SPI_MODE0);
 
@@ -78,39 +78,93 @@ static void tftCmd(uint8_t cmd, const uint8_t* data = nullptr, size_t n = 0) {
   if (n) SPI.writeBytes(data, n);
 }
 
+struct TftStep { uint8_t cmd, len; uint8_t data[15]; uint16_t waitMs; };
+
+#if TFT_IS_ILI9341
+// LCDWiki's ILI9341V_Init.txt for this panel, with MADCTL written once at the right place.
+// The panel's RST is tied to the ESP32's EN, so a software reset covers soft reboots.
+static const TftStep TFT_INIT[] = {
+  {0x01, 0, {0}, 120},                                    // software reset
+  {0xCF, 3, {0x00, 0xC1, 0x30}, 0},
+  {0xED, 4, {0x64, 0x03, 0x12, 0x81}, 0},
+  {0xE8, 3, {0x85, 0x00, 0x78}, 0},
+  {0xCB, 5, {0x39, 0x2C, 0x00, 0x34, 0x02}, 0},
+  {0xF7, 1, {0x20}, 0},
+  {0xEA, 2, {0x00, 0x00}, 0},
+  {0xC0, 1, {0x13}, 0},                                   // power control
+  {0xC1, 1, {0x13}, 0},
+  {0xC5, 2, {0x22, 0x35}, 0},                             // VCOM
+  {0xC7, 1, {0xBD}, 0},
+  {0x21, 0, {0}, 0},                                      // inversion on (IPS)
+  {0x36, 1, {TFT_MADCTL}, 0},                             // orientation + BGR
+  {0xB6, 2, {0x0A, 0xA2}, 0},
+  {0x3A, 1, {0x55}, 0},                                   // RGB565
+  {0xF6, 2, {0x01, 0x30}, 0},
+  {0xB1, 2, {0x00, 0x1B}, 0},                             // frame rate
+  {0xF2, 1, {0x00}, 0},
+  {0x26, 1, {0x01}, 0},                                   // gamma curve
+  {0xE0, 15, {0x0F, 0x35, 0x31, 0x0B, 0x0E, 0x06, 0x49, 0xA7, 0x33, 0x07, 0x0F, 0x03, 0x0C, 0x0A, 0x00}, 0},
+  {0xE1, 15, {0x00, 0x0A, 0x0F, 0x04, 0x11, 0x08, 0x36, 0x58, 0x4D, 0x07, 0x10, 0x0C, 0x32, 0x34, 0x0F}, 0},
+  {0x11, 0, {0}, 120},                                    // sleep out
+  {0x29, 0, {0}, 20},                                     // display on
+};
+#else
+// Init sequence from LilyGO's T-Deck examples (ST7789), landscape.
+static const TftStep TFT_INIT[] = {
+  {0x01, 0, {0}, 120},
+  {0x11, 0, {0}, 120},
+  {0x3A, 1, {0x55}, 0},
+  {0x36, 1, {TFT_MADCTL}, 0},
+  {0xB2, 5, {0x0C, 0x0C, 0x00, 0x33, 0x33}, 0},
+  {0xB7, 1, {0x75}, 0},
+  {0xBB, 1, {0x1A}, 0},
+  {0xC0, 1, {0x2C}, 0},
+  {0xC2, 1, {0x01}, 0},
+  {0xC3, 1, {0x13}, 0},
+  {0xC4, 1, {0x20}, 0},
+  {0xC6, 1, {0x0F}, 0},
+  {0xD0, 2, {0xA4, 0xA1}, 0},
+  {0xD6, 1, {0xA1}, 0},
+  {0xE0, 14, {0xD0, 0x0D, 0x14, 0x0D, 0x0D, 0x09, 0x38, 0x44, 0x4E, 0x3A, 0x17, 0x18, 0x2F, 0x30}, 0},
+  {0xE1, 14, {0xD0, 0x09, 0x0F, 0x08, 0x07, 0x14, 0x37, 0x44, 0x4D, 0x38, 0x15, 0x16, 0x2C, 0x3E}, 0},
+  {0x21, 0, {0}, 0},    // inversion on (this panel needs it)
+  {0x29, 0, {0}, 20},   // display on
+};
+#endif
+
 static void tftInit() {
-  // Init sequence from LilyGO's T-Deck examples, landscape (MADCTL 0x60).
-  struct Step { uint8_t cmd, len; uint8_t data[14]; uint16_t waitMs; };
-  static const Step seq[] = {
-    {0x01, 0, {0}, 120},
-    {0x11, 0, {0}, 120},
-    {0x3A, 1, {0x55}, 0},
-    {0x36, 1, {0x60}, 0},
-    {0xB2, 5, {0x0C, 0x0C, 0x00, 0x33, 0x33}, 0},
-    {0xB7, 1, {0x75}, 0},
-    {0xBB, 1, {0x1A}, 0},
-    {0xC0, 1, {0x2C}, 0},
-    {0xC2, 1, {0x01}, 0},
-    {0xC3, 1, {0x13}, 0},
-    {0xC4, 1, {0x20}, 0},
-    {0xC6, 1, {0x0F}, 0},
-    {0xD0, 2, {0xA4, 0xA1}, 0},
-    {0xD6, 1, {0xA1}, 0},
-    {0xE0, 14, {0xD0, 0x0D, 0x14, 0x0D, 0x0D, 0x09, 0x38, 0x44, 0x4E, 0x3A, 0x17, 0x18, 0x2F, 0x30}, 0},
-    {0xE1, 14, {0xD0, 0x09, 0x0F, 0x08, 0x07, 0x14, 0x37, 0x44, 0x4D, 0x38, 0x15, 0x16, 0x2C, 0x3E}, 0},
-    {0x21, 0, {0}, 0},    // inversion on (this panel needs it)
-    {0x29, 0, {0}, 20},   // display on
-  };
   pinMode(PIN_TFT_DC, OUTPUT);
   SPI.beginTransaction(tftSPI);
   digitalWrite(PIN_TFT_CS, LOW);
-  for (const Step& s : seq) {
+  for (const TftStep& s : TFT_INIT) {
     tftCmd(s.cmd, s.data, s.len);
     if (s.waitMs) delay(s.waitMs);
   }
   digitalWrite(PIN_TFT_CS, HIGH);
   SPI.endTransaction();
 }
+
+#if TFT_IS_ILI9341
+// Read one parameter byte of a read command (ILI9341 SPI uses the 0xD9 index trick, as Adafruit's driver does).
+static uint8_t tftRead8(uint8_t cmd, uint8_t index = 0) {
+  SPI.beginTransaction(SPISettings(4000000, MSBFIRST, SPI_MODE0));
+  digitalWrite(PIN_TFT_CS, LOW);
+  uint8_t idx = 0x10 + index;
+  tftCmd(0xD9, &idx, 1);
+  tftCmd(cmd);
+  uint8_t v = SPI.transfer(0);
+  digitalWrite(PIN_TFT_CS, HIGH);
+  SPI.endTransaction();
+  return v;
+}
+
+// Proves the SPI wiring both ways: these come back from the panel itself.
+static void logPanel() {
+  LOG("[tft] ID4=%02X %02X %02X (want 00 93 41)  power=0x%02X (want 0x9C)  MADCTL=0x%02X (want 0x%02X)  pixfmt=0x%02X\n",
+      tftRead8(0xD3, 1), tftRead8(0xD3, 2), tftRead8(0xD3, 3), tftRead8(0x0A), tftRead8(0x0B), TFT_MADCTL,
+      tftRead8(0x0C));
+}
+#endif
 
 static void pushFrame() {
   static const uint8_t cols[4] = {0, 0, (SCREEN_W - 1) >> 8, (SCREEN_W - 1) & 0xFF};
@@ -128,17 +182,24 @@ static void pushFrame() {
   SPI.endTransaction();
 }
 
-// The T-Deck backlight driver takes pulses: 16 levels, 16 = brightest (from LilyGO's example).
+// Backlight level 1..16 (16 = brightest).
 static void setBacklight(uint8_t value) {
-  static uint8_t level = 0;
   const uint8_t steps = 16;
-  if (value == 0) { digitalWrite(PIN_TFT_BL, 0); delay(3); level = 0; return; }
   if (value > steps) value = steps;
+#if BACKLIGHT_PWM
+  static bool attached = false;
+  if (!attached) attached = ledcAttach(PIN_TFT_BL, 20000, 8);
+  ledcWrite(PIN_TFT_BL, (value * value * 255 + 255) / 256);   // squared for an even-looking ramp
+#else
+  // T-Deck: the driver takes pulses, 16 levels (from LilyGO's example).
+  static uint8_t level = 0;
+  if (value == 0) { digitalWrite(PIN_TFT_BL, 0); delay(3); level = 0; return; }
   if (level == 0) { digitalWrite(PIN_TFT_BL, 1); level = steps; delayMicroseconds(30); }
   int from = steps - level, to = steps - value;
   int num = (steps + to - from) % steps;
   for (int i = 0; i < num; i++) { digitalWrite(PIN_TFT_BL, 0); digitalWrite(PIN_TFT_BL, 1); }
   level = value;
+#endif
 }
 
 static void render() {
@@ -162,7 +223,7 @@ static void readBattery() {
   uint32_t mv = 0;
   for (int i = 0; i < 8; i++) mv += analogReadMilliVolts(PIN_BAT_ADC);
   battRawMv = mv / 8;
-  float v = battRawMv * 2 / 1000.0f;   // 1:2 divider on the board
+  float v = battRawMv * 2 / 1000.0f;   // 1:2 divider on both boards
   S.battV = S.battV == 0 ? v : S.battV * 0.8f + v * 0.2f;
   static const float curve[][2] = {{4.20f, 100}, {4.10f, 90}, {4.00f, 80}, {3.92f, 70}, {3.85f, 60}, {3.80f, 50},
                                    {3.75f, 40}, {3.70f, 30}, {3.65f, 20}, {3.55f, 10}, {3.40f, 5}, {3.30f, 0}};
@@ -241,10 +302,11 @@ static void pollScan() {
   memcpy(S.nets, tmp, sizeof(NetInfo) * S.netCount);
   if (S.netSel >= S.netCount) S.netSel = S.netCount ? S.netCount - 1 : 0;
   if (S.netScroll > S.netSel) S.netScroll = S.netSel;
+  LOG("[scan] %d networks\n", n);
 }
 
 // ===========================================================================
-//  LoRa chat
+//  LoRa chat (boards with an SX1262)
 // ===========================================================================
 static void pushLine(uint8_t kind, const char* text, int16_t rssi) {
   if (S.chatCount == MAX_CHAT) {
@@ -285,6 +347,7 @@ static void addMessage(uint8_t kind, const char* from, const char* msg, int16_t 
   dirty = true;
 }
 
+#if HAS_LORA
 static void initRadio() {
   int st = radio.begin(LORA_FREQ_MHZ, LORA_BW_KHZ, LORA_SF, LORA_CR, LORA_SYNC_WORD, LORA_TX_DBM, 10);
   radioErr = st;
@@ -342,18 +405,28 @@ static void sendMessage() {
   }
   S.input[0] = 0;
 }
+#else
+static void sendMessage() { S.input[0] = 0; }
+#endif
 
 // ===========================================================================
-//  SD card
+//  SD card (SPI on the T-Deck, 4-bit SDIO on the ES3C28P)
 // ===========================================================================
 static bool mountSD() {
   if (S.sdOk) return true;
+#if SD_OVER_SPI
   SD.end();
   S.sdOk = SD.begin(PIN_SD_CS, SPI, 4000000) && SD.cardType() != CARD_NONE;
+#else
+  SD_MMC.end();
+  SD_MMC.setPins(PIN_SD_CLK, PIN_SD_CMD, PIN_SD_D0, PIN_SD_D1, PIN_SD_D2, PIN_SD_D3);
+  S.sdOk = SD_MMC.begin("/sdcard", false) && SD_MMC.cardType() != CARD_NONE;
+#endif
   if (S.sdOk) {
-    S.sdTotalGB = SD.totalBytes() / 1e9f;
-    S.sdUsedGB = SD.usedBytes() / 1e9f;
+    S.sdTotalGB = SDCARD.totalBytes() / 1e9f;
+    S.sdUsedGB = SDCARD.usedBytes() / 1e9f;
   }
+  LOG("[sd] %s\n", S.sdOk ? "mounted" : "no card / mount failed");
   return S.sdOk;
 }
 
@@ -361,7 +434,7 @@ static void loadDir() {
   S.fileCount = 0;
   S.fileSel = 0;
   S.fileScroll = 0;
-  File dir = SD.open(S.path);
+  File dir = SDCARD.open(S.path);
   if (!dir || !dir.isDirectory()) {     // card pulled, or path vanished
     if (dir) dir.close();
     if (strcmp(S.path, "/") != 0) { strcpy(S.path, "/"); loadDir(); return; }
@@ -386,8 +459,9 @@ static void loadDir() {
 }
 
 // ===========================================================================
-//  Input: trackball (interrupt counted), click button, I2C keyboard
+//  Input: T-Deck trackball + click + I2C keyboard
 // ===========================================================================
+#if HAS_TRACKBALL
 static volatile int16_t ballUp, ballDown, ballLeft, ballRight;
 static void IRAM_ATTR isrUp()    { ballUp = ballUp + 1; }
 static void IRAM_ATTR isrDown()  { ballDown = ballDown + 1; }
@@ -401,7 +475,7 @@ static void initTrackball() {
     pinMode(pins[i], INPUT_PULLUP);
     attachInterrupt(digitalPinToInterrupt(pins[i]), isrs[i], CHANGE);
   }
-  pinMode(PIN_BALL_CLICK, INPUT_PULLUP);
+  pinMode(PIN_BUTTON, INPUT_PULLUP);
 }
 
 static void pollTrackball() {
@@ -423,14 +497,16 @@ static void pollTrackball() {
 
   static bool lastDown = false;
   static uint32_t changed = 0;
-  bool down = digitalRead(PIN_BALL_CLICK) == LOW;
+  bool down = digitalRead(PIN_BUTTON) == LOW;
   if (down != lastDown && now - changed > 30) {
     changed = now;
     lastDown = down;
-    if (down) handle(EV_CLICK);
+    if (down) handle(BUTTON_EVENT);
   }
 }
+#endif
 
+#if HAS_KEYBOARD
 static bool probeKeyboard() {
   Wire.beginTransmission(KEYBOARD_ADDR);
   return Wire.endTransmission() == 0;
@@ -438,13 +514,146 @@ static bool probeKeyboard() {
 
 static void pollKeyboard() {
   static uint32_t last = 0;
-  if (!S.kbOk || millis() - last < 20) return;
+  if (!S.inputOk || millis() - last < 20) return;
   last = millis();
   if (Wire.requestFrom(KEYBOARD_ADDR, 1) == 1) {
     char c = Wire.read();
     if (c) handle(EV_KEY, c);
   }
 }
+#endif
+
+// ===========================================================================
+//  Input: touchscreen (FT6336) + BOOT key, read by a task on core 0.
+//  A full frame takes ~100 ms on the loop core, so polling there would drop quick taps.
+//  The task turns raw touches into gestures and queues them; loop() acts on them.
+// ===========================================================================
+#if HAS_TOUCH
+static QueueHandle_t touchQ = nullptr;
+static const int TAP_SLOP = 10;      // px a finger may wander and still count as a tap
+static const int DRAG_STEP = 15;     // px of vertical drag per list step (about one row)
+static const int SWIPE_BACK = 60;    // px of rightward swipe that means "back"
+
+static bool i2cReadReg(uint8_t addr, uint8_t reg, uint8_t* out, uint8_t n) {
+  Wire.beginTransmission(addr);
+  Wire.write(reg);
+  if (Wire.endTransmission() != 0) return false;
+  if (Wire.requestFrom(addr, n) != n) return false;
+  for (int i = 0; i < n; i++) out[i] = Wire.read();
+  return true;
+}
+
+// One touch point in screen coordinates. false = no finger (or the chip didn't answer).
+static bool touchRead(int& x, int& y, int& rx, int& ry) {
+  uint8_t d[5];
+  if (!i2cReadReg(TOUCH_ADDR, 0x02, d, 5)) return false;   // TD_STATUS, P1_XH, P1_XL, P1_YH, P1_YL
+  uint8_t n = d[0] & 0x0F;
+  if (n == 0 || n > 2) return false;
+  rx = ((d[1] & 0x0F) << 8) | d[2];
+  ry = ((d[3] & 0x0F) << 8) | d[4];
+  int sx = TOUCH_SWAP_XY ? ry : rx, sy = TOUCH_SWAP_XY ? rx : ry;
+  if (TOUCH_FLIP_X) sx = SCREEN_W - 1 - sx;
+  if (TOUCH_FLIP_Y) sy = SCREEN_H - 1 - sy;
+  x = constrain(sx, 0, SCREEN_W - 1);
+  y = constrain(sy, 0, SCREEN_H - 1);
+  return true;
+}
+
+static void sendTouch(TouchKind k, int x = 0, int y = 0, int rx = 0, int ry = 0) {
+  TouchEv ev = {k, (int16_t)x, (int16_t)y, (int16_t)rx, (int16_t)ry};
+  xQueueSend(touchQ, &ev, 0);
+}
+
+static void inputTask(void*) {
+  bool was = false, dragged = false;
+  int x0 = 0, y0 = 0, rx0 = 0, ry0 = 0, lx = 0, ly = 0, acc = 0;
+  bool btnDown = false;
+  uint8_t btnStable = 0;
+  for (;;) {
+    int x, y, rx, ry;
+    bool down = touchRead(x, y, rx, ry);
+    if (down && !was) { x0 = lx = x; y0 = ly = y; rx0 = rx; ry0 = ry; dragged = false; acc = 0; }
+    else if (down) {
+      if (!dragged && (abs(x - x0) > TAP_SLOP || abs(y - y0) > TAP_SLOP)) dragged = true;
+      if (dragged && abs(y - y0) > abs(x - x0)) {                // vertical drag scrolls lists
+        acc += y - ly;
+        while (acc <= -DRAG_STEP) { acc += DRAG_STEP; sendTouch(TE_STEP, +1); }   // finger up -> next item
+        while (acc >= DRAG_STEP)  { acc -= DRAG_STEP; sendTouch(TE_STEP, -1); }
+      }
+      lx = x; ly = y;
+    } else if (was) {                                            // finger lifted
+      if (!dragged) sendTouch(TE_TAP, x0, y0, rx0, ry0);
+      else if (lx - x0 > SWIPE_BACK && abs(ly - y0) < 50) sendTouch(TE_BACK);
+    }
+    was = down;
+
+    // BOOT key: act on press after 30 ms stable
+    bool b = digitalRead(PIN_BUTTON) == LOW;
+    if (b != btnDown) { if (++btnStable >= 3) { btnDown = b; btnStable = 0; if (b) sendTouch(TE_BUTTON); } }
+    else btnStable = 0;
+
+    vTaskDelay(pdMS_TO_TICKS(10));
+  }
+}
+
+static bool initTouch() {
+  pinMode(PIN_TOUCH_RST, OUTPUT);
+  digitalWrite(PIN_TOUCH_RST, LOW);
+  delay(10);
+  digitalWrite(PIN_TOUCH_RST, HIGH);
+  delay(300);                                    // FT6336 needs ~300 ms after reset
+  pinMode(PIN_TOUCH_INT, INPUT_PULLUP);
+  pinMode(PIN_BUTTON, INPUT_PULLUP);
+  Wire.begin(PIN_I2C_SDA, PIN_I2C_SCL, 400000);
+
+  char found[64] = "";
+  for (uint8_t a = 1; a < 127; a++) {
+    Wire.beginTransmission(a);
+    if (Wire.endTransmission() == 0) snprintf(found + strlen(found), sizeof found - strlen(found), " 0x%02X", a);
+  }
+  uint8_t id = 0, vendor = 0;
+  bool ok = i2cReadReg(TOUCH_ADDR, 0xA3, &id, 1);
+  i2cReadReg(TOUCH_ADDR, 0xA8, &vendor, 1);
+  LOG("[i2c] devices:%s\n", found[0] ? found : " none");
+  LOG("[touch] %s  chip id 0x%02X (FT6336G = 0x64)  vendor 0x%02X\n", ok ? "found" : "NOT FOUND", id, vendor);
+  return ok;
+}
+
+static void startInputTask() {
+  touchQ = xQueueCreate(16, sizeof(TouchEv));
+  xTaskCreatePinnedToCore(inputTask, "input", 4096, nullptr, 2, nullptr, 0);
+}
+
+static void onTap(const TouchEv& ev) {
+  UiHit h = uiHitTest(S, ev.x, ev.y);
+  static const char* const HN[] = {"none", "back", "item", "action"};
+  LOG("[touch] tap raw=(%d,%d) screen=(%d,%d) scr=%d hit=%s %d\n", ev.rawX, ev.rawY, ev.x, ev.y, S.screen,
+      HN[h.kind], h.index);
+  switch (h.kind) {
+    case HIT_BACK:   handle(EV_LEFT); break;
+    case HIT_ACTION: handle(EV_CLICK); break;
+    case HIT_ITEM:
+      if (S.screen == SCR_HOME)       { S.menuSel = h.index; handle(EV_CLICK); }
+      else if (S.screen == SCR_TOOLS) { S.toolSel = h.index; handle(EV_CLICK); }
+      else if (S.screen == SCR_FILES) { S.fileSel = h.index; handle(EV_CLICK); }
+      else if (S.screen == SCR_SCAN)  { S.netSel = h.index; dirty = true; }
+      break;
+    default: break;
+  }
+}
+
+static void pollTouch() {
+  TouchEv ev;
+  while (xQueueReceive(touchQ, &ev, 0) == pdTRUE) {
+    switch (ev.kind) {
+      case TE_TAP:    onTap(ev); break;
+      case TE_STEP:   handle(ev.x > 0 ? EV_DOWN : EV_UP); break;
+      case TE_BACK:   LOG("[touch] swipe back\n"); handle(EV_LEFT); break;
+      case TE_BUTTON: LOG("[btn] BOOT\n"); handle(BUTTON_EVENT); break;
+    }
+  }
+}
+#endif
 
 // ===========================================================================
 //  Screens and navigation
@@ -580,13 +789,26 @@ static void bootDone(int i, uint8_t status) {
 
 void setup() {
   Serial.begin(115200);
+#ifdef PIN_POWER_ON
   pinMode(PIN_POWER_ON, OUTPUT);
   digitalWrite(PIN_POWER_ON, HIGH);
+#endif
   uint32_t poweredAt = millis();
+#ifdef PIN_LED_RGB
+  rgbLedWrite(PIN_LED_RGB, 0, 0, 0);   // the LED keeps its last colour across resets
+#endif
 
   // every SPI device deselected before the bus starts
-  for (uint8_t cs : {PIN_SD_CS, PIN_RADIO_CS, PIN_TFT_CS}) { pinMode(cs, OUTPUT); digitalWrite(cs, HIGH); }
+  pinMode(PIN_TFT_CS, OUTPUT); digitalWrite(PIN_TFT_CS, HIGH);
+#if SD_OVER_SPI
+  pinMode(PIN_SD_CS, OUTPUT); digitalWrite(PIN_SD_CS, HIGH);
+#endif
+#if HAS_LORA
+  pinMode(PIN_RADIO_CS, OUTPUT); digitalWrite(PIN_RADIO_CS, HIGH);
+#endif
+#if !BACKLIGHT_PWM
   pinMode(PIN_TFT_BL, OUTPUT);
+#endif
   pinMode(PIN_SPI_MISO, INPUT_PULLUP);
   SPI.begin(PIN_SPI_SCK, PIN_SPI_MISO, PIN_SPI_MOSI);
 
@@ -599,26 +821,48 @@ void setup() {
   S.glow = prefs.getBool("glow", DEFAULT_GLOW);
   S.title = DECK_TITLE;
   S.freqMhz = LORA_FREQ_MHZ;
+  S.touchUi = HAS_TOUCH;
+  S.hasRadio = HAS_LORA;
+  S.boardName = BOARD_NAME;
+  S.bootTotal = 4 + HAS_KEYBOARD + HAS_TRACKBALL + HAS_LORA + HAS_TOUCH;   // + DISPLAY, SD, BATTERY, SYSTEM
   S.screen = SCR_BOOT;
+  LOG("\n[cyberdeck] board %s\n", BOARD_NAME);
 
   tftInit();
   int i = bootStep("DISPLAY");
   setBacklight(S.brightness);
+#if TFT_IS_ILI9341
+  logPanel();
+#endif
   bootDone(i, 1);
 
+#if HAS_KEYBOARD
   i = bootStep("KEYBOARD");
   while (millis() - poweredAt < 600) delay(10);   // keyboard MCU needs time after power-on
   Wire.begin(PIN_I2C_SDA, PIN_I2C_SCL);
-  for (int tries = 0; tries < 5 && !S.kbOk; tries++) { S.kbOk = probeKeyboard(); if (!S.kbOk) delay(100); }
-  bootDone(i, S.kbOk ? 1 : 2);
+  for (int tries = 0; tries < 5 && !S.inputOk; tries++) { S.inputOk = probeKeyboard(); if (!S.inputOk) delay(100); }
+  bootDone(i, S.inputOk ? 1 : 2);
+#else
+  (void)poweredAt;
+#endif
 
+#if HAS_TOUCH
+  i = bootStep("TOUCH");
+  S.inputOk = initTouch();
+  bootDone(i, S.inputOk ? 1 : 2);
+#endif
+
+#if HAS_TRACKBALL
   i = bootStep("TRACKBALL");
   initTrackball();
   bootDone(i, 1);
+#endif
 
+#if HAS_LORA
   i = bootStep("LORA SX1262");
   initRadio();
   bootDone(i, S.radioOk ? 1 : 2);
+#endif
 
   i = bootStep("SD CARD");
   bootDone(i, mountSD() ? 1 : 3);
@@ -631,15 +875,27 @@ void setup() {
   initSystemInfo();
   bootDone(i, 1);
 
+#if HAS_TOUCH
+  startInputTask();
+#endif
   delay(350);
   S.screen = SCR_HOME;
   dirty = true;
 }
 
 void loop() {
+#if HAS_TRACKBALL
   pollTrackball();
+#endif
+#if HAS_KEYBOARD
   pollKeyboard();
+#endif
+#if HAS_TOUCH
+  pollTouch();
+#endif
+#if HAS_LORA
   pollRadio();
+#endif
   pollScan();
 
   static uint32_t lastSlow = 0;
@@ -649,10 +905,10 @@ void loop() {
     readSystem();
     static uint8_t tick = 0;
     if (++tick % 5 == 0)
-      LOG("[stat] up=%lus scr=%d batt=%lumV(pin) %.2fV %d%% heap=%lu psram=%lu draw=%luus push=%luus kb=%d rf=%d(%d) sd=%d\n",
+      LOG("[stat] up=%lus scr=%d batt=%lumV(pin) %.2fV %d%% heap=%lu psram=%lu draw=%luus push=%luus in=%d rf=%d(%d) sd=%d\n",
           (unsigned long)S.uptimeS, S.screen, (unsigned long)battRawMv, S.battV, S.battPct,
           (unsigned long)S.heapFree, (unsigned long)S.psramFree, (unsigned long)drawUs, (unsigned long)pushUs,
-          S.kbOk, S.radioOk, radioErr, S.sdOk);
+          S.inputOk, S.radioOk, radioErr, S.sdOk);
   }
 
   uint32_t interval = 1000;

@@ -28,19 +28,42 @@ static void battery(Canvas& g, int xRight, int y, int pct, int scale) {
   g.text(tx, y, buf, fill, scale);
 }
 
+// Touch boards: the whole header band (y < HEADER_H) is the back button, marked with "<".
+static const int HEADER_H = 46;
+
 static void header(Canvas& g, const UiState& s, const char* name, const char* info) {
   g.background();
   frame(g);
   char crumb[40];
   snprintf(crumb, sizeof crumb, "%s /", s.title);
   g.text(18, 13, crumb, C_SOFT, 1);
-  g.text(18, 24, name, C_BRIGHT, 2);
+  int nx = 18;
+  if (s.touchUi) { g.text(18, 24, "<", C_MID, 2); nx = 38; }
+  g.text(nx, 24, name, C_BRIGHT, 2);
   g.fillRect(16, 43, 288, 2, C_MID);
   battery(g, 304, 13, s.battPct, 1);
   if (info) g.textRight(304, 30, info, C_SOFT, 1);
 }
 
-static void footer(Canvas& g, const char* hint) { g.text(18, 220, hint, C_SOFT, 1); }
+// Touch boards get one tappable button at the right end of the footer on some screens.
+static const char* footerButton(const UiState& s) {
+  if (!s.touchUi) return nullptr;
+  if (s.screen == SCR_SCAN) return "RESCAN";
+  if (s.screen == SCR_FILES && !s.sdOk) return "RETRY";
+  return nullptr;
+}
+static int footerButtonX(const char* label) { return 304 - (Canvas::textW(label, 1) + 12); }
+
+// hint: keyboard/trackball text; touchHint: what touch boards show instead (nullptr = same).
+static void footer(Canvas& g, const UiState& s, const char* hint, const char* touchHint = nullptr) {
+  g.text(18, 220, s.touchUi && touchHint ? touchHint : hint, C_SOFT, 1);
+  if (const char* b = footerButton(s)) {
+    int bx = footerButtonX(b);
+    bool idle = !(s.screen == SCR_SCAN && s.scanning);
+    g.rect(bx, 216, Canvas::textW(b, 1) + 12, 16, idle ? C_MID : C_DIM);
+    g.text(bx + 6, 220, b, idle ? C_BRIGHT : C_DIM, 1);
+  }
+}
 
 static void scrollbar(Canvas& g, int x, int y, int h, int first, int visible, int total) {
   if (total <= visible) return;
@@ -167,7 +190,8 @@ static void drawHome(Canvas& g, const UiState& s) {
     int y = 54 + i * 30;
     bool sel = i == s.menuSel;
     if (sel) g.fillRect(14, y - 5, 136, 24, C_HILITE);
-    uint16_t c = sel ? C_INK : C_BRIGHT;
+    bool unavailable = i == 2 && !s.hasRadio;   // COMMS on a board without LoRa
+    uint16_t c = sel ? C_INK : unavailable ? C_DIM : C_BRIGHT;
     g.text(20, y, ">", c, 2);
     int end = g.text(40, y, MENU_LABELS[i], c, 2);
     if (i == 2 && s.unread > 0 && ((s.ms / 400) & 1))
@@ -175,8 +199,11 @@ static void drawHome(Canvas& g, const UiState& s) {
   }
 
   char st[48];
-  snprintf(st, sizeof st, "RF %s  SD %s  KB %s", s.radioOk ? "OK" : "--", s.sdOk ? "OK" : "--",
-           s.kbOk ? "OK" : "--");
+  const char* in = s.touchUi ? "TP" : "KB";
+  const char* sd = s.sdOk ? "OK" : "--";
+  const char* io = s.inputOk ? "OK" : "--";
+  if (s.hasRadio) snprintf(st, sizeof st, "RF %s  SD %s  %s %s", s.radioOk ? "OK" : "--", sd, in, io);
+  else snprintf(st, sizeof st, "SD %s  %s %s", sd, in, io);
   g.text(18, 211, st, C_SOFT, 1);
   battery(g, 306, 207, s.battPct, 2);
 }
@@ -207,7 +234,8 @@ static void drawBoot(Canvas& g, const UiState& s) {
     }
   }
   g.rect(44, 202, 232, 8, C_DIM);
-  g.fillRect(46, 204, 228 * done / BOOT_LINES, 4, C_MID);
+  int total = s.bootTotal > 0 ? s.bootTotal : BOOT_LINES;
+  g.fillRect(46, 204, 228 * (done < total ? done : total) / total, 4, C_MID);
 }
 
 // ---------------------------------------------------------------- system
@@ -243,11 +271,14 @@ static void drawSystem(Canvas& g, const UiState& s) {
   row("UPTIME", v, C_BRIGHT);
   snprintf(v, sizeof v, "%.2f V  %d%%", s.battV, s.battPct);               row("BATTERY", v, s.battPct <= 15 ? C_WARN : C_BRIGHT);
   row("MAC", s.mac, C_BRIGHT);
-  if (s.radioOk) snprintf(v, sizeof v, "SX1262 ONLINE  %.1f MHZ", s.freqMhz);
-  row("RADIO", s.radioOk ? v : "OFFLINE", s.radioOk ? C_BRIGHT : C_WARN);
+  if (!s.hasRadio) row("RADIO", "NONE ON THIS BOARD", C_SOFT);
+  else {
+    if (s.radioOk) snprintf(v, sizeof v, "SX1262 ONLINE  %.1f MHZ", s.freqMhz);
+    row("RADIO", s.radioOk ? v : "OFFLINE", s.radioOk ? C_BRIGHT : C_WARN);
+  }
   row("SD CARD", s.sdOk ? "MOUNTED" : "NOT FOUND", s.sdOk ? C_BRIGHT : C_WARN);
-  row("KEYBOARD", s.kbOk ? "ONLINE" : "NOT FOUND", s.kbOk ? C_BRIGHT : C_WARN);
-  footer(g, "< BACK");
+  row(s.touchUi ? "TOUCH" : "KEYBOARD", s.inputOk ? "ONLINE" : "NOT FOUND", s.inputOk ? C_BRIGHT : C_WARN);
+  footer(g, s, "< BACK", "TAP < TO GO BACK");
 }
 
 // ---------------------------------------------------------------- scan
@@ -288,7 +319,7 @@ static void drawScan(Canvas& g, const UiState& s) {
   if (s.netCount == 0) {
     if (s.scanning) radar(g, s);
     else g.textCenter(160, 120, "NO NETWORKS FOUND", C_SOFT, 1);
-    footer(g, "CLICK RESCAN   < BACK");
+    footer(g, s, "CLICK RESCAN   < BACK", "TAP < TO GO BACK");
     return;
   }
 
@@ -318,12 +349,20 @@ static void drawScan(Canvas& g, const UiState& s) {
     }
   }
   scrollbar(g, 300, y0 - 4, rows * rowH, s.netScroll, rows, s.netCount);
-  footer(g, "^v SELECT   CLICK RESCAN   < BACK");
+  footer(g, s, "^v SELECT   CLICK RESCAN   < BACK", "TAP ROW   DRAG TO SCROLL");
 }
 
 // ---------------------------------------------------------------- comms
 
 static void drawComms(Canvas& g, const UiState& s) {
+  if (!s.hasRadio) {
+    header(g, s, "COMMS", "NO RADIO");
+    g.textCenter(160, 100, "NO LORA RADIO", C_WARN, 2);
+    g.textCenter(160, 128, "THIS BOARD CAN'T SEND OR RECEIVE", C_SOFT, 1);
+    g.textCenter(160, 142, "CHAT NEEDS A DECK WITH AN SX1262", C_SOFT, 1);
+    footer(g, s, "< BACK", "TAP < TO GO BACK");
+    return;
+  }
   char info[24];
   if (s.radioOk) snprintf(info, sizeof info, "LORA %.1f MHZ", s.freqMhz);
   header(g, s, "COMMS", s.radioOk ? info : "RADIO OFFLINE");
@@ -358,7 +397,7 @@ static void drawComms(Canvas& g, const UiState& s) {
 
   char f[48];
   snprintf(f, sizeof f, "ENTER SEND   < BACK   AS %s", s.callsign);
-  footer(g, f);
+  footer(g, s, f);
 }
 
 // ---------------------------------------------------------------- tools
@@ -384,10 +423,12 @@ static void drawTools(Canvas& g, const UiState& s) {
   g.hline(16, 160, 288, C_DIM);
   snprintf(v, sizeof v, "CALLSIGN   %s", s.callsign);
   g.text(20, 170, v, C_SOFT, 1);
-  snprintf(v, sizeof v, "RADIO      %.1f MHZ", s.freqMhz);
+  if (s.hasRadio) snprintf(v, sizeof v, "RADIO      %.1f MHZ", s.freqMhz);
+  else snprintf(v, sizeof v, "RADIO      NONE");
   g.text(20, 184, v, C_SOFT, 1);
-  g.text(20, 198, "FIRMWARE   CYBERDECK 1.0 / T-DECK", C_SOFT, 1);
-  footer(g, "^v SELECT   CLICK CHANGE   < BACK");
+  snprintf(v, sizeof v, "FIRMWARE   CYBERDECK 1.0 / %s", s.boardName);
+  g.text(20, 198, v, C_SOFT, 1);
+  footer(g, s, "^v SELECT   CLICK CHANGE   < BACK", "TAP A SETTING TO CHANGE IT");
 }
 
 // ---------------------------------------------------------------- files
@@ -400,8 +441,8 @@ static void drawFiles(Canvas& g, const UiState& s) {
   if (!s.sdOk) {
     g.textCenter(160, 104, "NO SD CARD", C_WARN, 2);
     g.textCenter(160, 132, "INSERT A FAT32 MICROSD", C_SOFT, 1);
-    g.textCenter(160, 146, "THEN CLICK TO RETRY", C_SOFT, 1);
-    footer(g, "CLICK RETRY   < BACK");
+    g.textCenter(160, 146, s.touchUi ? "THEN TAP RETRY" : "THEN CLICK TO RETRY", C_SOFT, 1);
+    footer(g, s, "CLICK RETRY   < BACK", "TAP < TO GO BACK");
     return;
   }
 
@@ -429,7 +470,7 @@ static void drawFiles(Canvas& g, const UiState& s) {
     g.textRight(292, y, sz, soft, 1);
   }
   scrollbar(g, 300, y0 - 4, rows * rowH, s.fileScroll, rows, s.fileCount);
-  footer(g, "^v SELECT   CLICK OPEN   < UP");
+  footer(g, s, "^v SELECT   CLICK OPEN   < UP", "TAP FOLDER TO OPEN   DRAG TO SCROLL");
 }
 
 // ----------------------------------------------------------------
@@ -444,4 +485,40 @@ void drawScreen(Canvas& g, const UiState& s) {
     case SCR_TOOLS:  drawTools(g, s); break;
     case SCR_FILES:  drawFiles(g, s); break;
   }
+}
+
+// ---------------------------------------------------------------- touch hit areas
+// Bands are a little taller than the drawn highlight bars so a fingertip doesn't miss.
+// Keep these in step with the layout constants in the draw functions above.
+
+UiHit uiHitTest(const UiState& s, int x, int y) {
+  const UiHit none = {HIT_NONE, 0};
+  if (s.screen == SCR_BOOT) return none;
+  if (s.screen == SCR_HOME) {                       // menu items at y = 54 + i*30, bars 136 px wide
+    if (x < 160 && y >= 46 && y < 46 + MENU_COUNT * 30) return {HIT_ITEM, (y - 46) / 30};
+    return none;
+  }
+  if (y < HEADER_H) return {HIT_BACK, 0};
+  if (const char* b = footerButton(s))
+    if (y >= 208 && x >= footerButtonX(b) - 8) return {HIT_ACTION, 0};
+
+  switch (s.screen) {
+    case SCR_SCAN:                                   // rows at y = 54 + r*15, bar from y-4
+      if (s.netCount && y >= 50) {
+        int r = (y - 50) / 15, i = s.netScroll + r;
+        if (r < SCAN_ROWS && i < s.netCount) return {HIT_ITEM, i};
+      }
+      break;
+    case SCR_FILES:                                  // rows at y = 68 + r*14, bar from y-4
+      if (s.sdOk && y >= 64) {
+        int r = (y - 64) / 14, i = s.fileScroll + r;
+        if (r < FILE_ROWS && i < s.fileCount) return {HIT_ITEM, i};
+      }
+      break;
+    case SCR_TOOLS:                                  // rows at y = 62 + i*32, bar from y-5
+      if (y >= 53 && y < 53 + 3 * 32) return {HIT_ITEM, (y - 53) / 32};
+      break;
+    default: break;
+  }
+  return none;
 }
