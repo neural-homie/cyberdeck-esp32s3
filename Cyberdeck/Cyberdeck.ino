@@ -49,11 +49,17 @@
 enum Ev { EV_UP, EV_DOWN, EV_LEFT, EV_RIGHT, EV_CLICK, EV_KEY };
 static void handle(Ev e, char key = 0);
 
+// Serial log for bring-up (115200, `make monitor`). Skipped when no USB host is listening.
+#define LOG(...) do { if (Serial) Serial.printf(__VA_ARGS__); } while (0)
+
 static UiState S;
 static uint16_t* fb = nullptr;
 static uint8_t lineBuf[SCREEN_W * 2];
 static bool dirty = true;
 static uint32_t lastFrame = 0;
+static uint32_t drawUs = 0, pushUs = 0;   // last frame timings, for the [stat] log
+static uint32_t battRawMv = 0;            // ADC pin mV before the x2 divider correction
+static int radioErr = 0;                  // RadioLib begin() result
 static Preferences prefs;
 
 SX1262 radio = new Module(PIN_RADIO_CS, PIN_RADIO_DIO1, PIN_RADIO_RST, PIN_RADIO_BUSY, SPI);
@@ -139,8 +145,12 @@ static void render() {
   S.ms = millis();
   Canvas g;
   g.fb = fb;
+  uint32_t t0 = micros();
   drawScreen(g, S);
+  uint32_t t1 = micros();
   pushFrame();
+  drawUs = t1 - t0;
+  pushUs = micros() - t1;
   lastFrame = millis();
   dirty = false;
 }
@@ -151,7 +161,8 @@ static void render() {
 static void readBattery() {
   uint32_t mv = 0;
   for (int i = 0; i < 8; i++) mv += analogReadMilliVolts(PIN_BAT_ADC);
-  float v = (mv / 8) * 2 / 1000.0f;   // 1:2 divider on the board
+  battRawMv = mv / 8;
+  float v = battRawMv * 2 / 1000.0f;   // 1:2 divider on the board
   S.battV = S.battV == 0 ? v : S.battV * 0.8f + v * 0.2f;
   static const float curve[][2] = {{4.20f, 100}, {4.10f, 90}, {4.00f, 80}, {3.92f, 70}, {3.85f, 60}, {3.80f, 50},
                                    {3.75f, 40}, {3.70f, 30}, {3.65f, 20}, {3.55f, 10}, {3.40f, 5}, {3.30f, 0}};
@@ -276,6 +287,8 @@ static void addMessage(uint8_t kind, const char* from, const char* msg, int16_t 
 
 static void initRadio() {
   int st = radio.begin(LORA_FREQ_MHZ, LORA_BW_KHZ, LORA_SF, LORA_CR, LORA_SYNC_WORD, LORA_TX_DBM, 10);
+  radioErr = st;
+  LOG("[radio] begin() = %d\n", st);
   if (st != RADIOLIB_ERR_NONE) {
     char e[40];
     snprintf(e, sizeof e, "-- RADIO INIT FAILED (%d) --", st);
@@ -473,6 +486,9 @@ static void filesBack() {
 }
 
 static void handle(Ev e, char key) {
+  static const char* const EV_NAMES[] = {"UP", "DOWN", "LEFT", "RIGHT", "CLICK", "KEY"};
+  if (e == EV_KEY) LOG("[in] KEY 0x%02X '%c' scr=%d\n", (uint8_t)key, key >= 32 && key <= 126 ? key : '.', S.screen);
+  else LOG("[in] %s scr=%d\n", EV_NAMES[e], S.screen);
   dirty = true;
   bool enter = e == EV_KEY && (key == '\r' || key == '\n');
   bool bksp = e == EV_KEY && key == 0x08;
@@ -555,6 +571,8 @@ static int bootStep(const char* label) {
 }
 
 static void bootDone(int i, uint8_t status) {
+  static const char* const ST[] = {"...", "OK", "FAIL", "--"};
+  LOG("[boot] %-12s %s\n", S.boot[i].label, ST[status & 3]);
   S.boot[i].status = status;
   render();
   delay(140);
@@ -629,6 +647,12 @@ void loop() {
     lastSlow = millis();
     readBattery();
     readSystem();
+    static uint8_t tick = 0;
+    if (++tick % 5 == 0)
+      LOG("[stat] up=%lus scr=%d batt=%lumV(pin) %.2fV %d%% heap=%lu psram=%lu draw=%luus push=%luus kb=%d rf=%d(%d) sd=%d\n",
+          (unsigned long)S.uptimeS, S.screen, (unsigned long)battRawMv, S.battV, S.battPct,
+          (unsigned long)S.heapFree, (unsigned long)S.psramFree, (unsigned long)drawUs, (unsigned long)pushUs,
+          S.kbOk, S.radioOk, radioErr, S.sdOk);
   }
 
   uint32_t interval = 1000;
