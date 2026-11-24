@@ -3,7 +3,12 @@
 #include <stdint.h>
 #include "gfx.h"
 
-enum Screen : uint8_t { SCR_BOOT, SCR_HOME, SCR_SYSTEM, SCR_SCAN, SCR_COMMS, SCR_TOOLS, SCR_FILES };
+// Home menu order must match SCR_SYSTEM..SCR_FILES. Screens after SCR_FILES are not on the menu.
+enum Screen : uint8_t { SCR_BOOT, SCR_HOME, SCR_SYSTEM, SCR_SCAN, SCR_COMMS, SCR_TOOLS, SCR_FILES, SCR_TOUCHCAL };
+
+// Touch calibration targets (screen px), tapped in this order.
+#define CAL_POINTS 4
+extern const int16_t CAL_TARGETS[CAL_POINTS][2];
 
 #define MENU_COUNT   5
 #define MAX_NETS     32
@@ -60,6 +65,10 @@ struct UiState {
   char callsign[16] = "";
   float freqMhz = 0;
   int lastRssi = 0;
+
+  // touch calibration
+  int calStep = 0;               // index of the crosshair to tap next
+  bool calFailed = false;        // last attempt's points didn't agree; asking again
 
   // tools
   int toolSel = 0;

@@ -192,6 +192,8 @@ static const Scene SCENES[] = {
   {"tools", [](UiState& s) { s.screen = SCR_TOOLS; }},
   {"files", [](UiState& s) { s.screen = SCR_FILES; files(s); s.fileSel = 4; }},
   {"files_nocard", [](UiState& s) { s.screen = SCR_FILES; s.sdOk = false; }},
+  {"touchcal", [](UiState& s) { s.screen = SCR_TOUCHCAL; s.calStep = 1; s.ms = 300; }},
+  {"touchcal_retry", [](UiState& s) { s.screen = SCR_TOUCHCAL; s.calStep = 0; s.calFailed = true; s.ms = 300; }},
 };
 
 // Each scene is rendered once per board profile. The T-Deck keeps the original file names.

@@ -4,6 +4,7 @@
 #include <math.h>
 
 const char* const MENU_LABELS[MENU_COUNT] = {"SYSTEM", "SCAN", "COMMS", "TOOLS", "FILES"};
+const int16_t CAL_TARGETS[CAL_POINTS][2] = {{32, 32}, {288, 32}, {288, 208}, {32, 208}};
 
 static const int GROUND = 198;   // skyline baseline on the home screen
 
@@ -421,7 +422,8 @@ static void drawTools(Canvas& g, const UiState& s) {
   }
   char v[48];
   g.hline(16, 160, 288, C_DIM);
-  snprintf(v, sizeof v, "CALLSIGN   %s", s.callsign);
+  if (s.touchUi && !s.hasRadio) snprintf(v, sizeof v, "TOUCH      HOLD BOOT KEY TO CALIBRATE");
+  else snprintf(v, sizeof v, "CALLSIGN   %s", s.callsign);
   g.text(20, 170, v, C_SOFT, 1);
   if (s.hasRadio) snprintf(v, sizeof v, "RADIO      %.1f MHZ", s.freqMhz);
   else snprintf(v, sizeof v, "RADIO      NONE");
@@ -473,6 +475,32 @@ static void drawFiles(Canvas& g, const UiState& s) {
   footer(g, s, "^v SELECT   CLICK OPEN   < UP", "TAP FOLDER TO OPEN   DRAG TO SCROLL");
 }
 
+// ---------------------------------------------------------------- touch calibration
+
+static void drawTouchCal(Canvas& g, const UiState& s) {
+  g.background();
+  frame(g);
+  g.textCenter(160, 92, "TOUCH CALIBRATION", C_BRIGHT, 2);
+  if (s.calFailed) g.textCenter(160, 116, "POINTS DIDN'T LINE UP. AGAIN, PLEASE", C_WARN, 1);
+  else g.textCenter(160, 116, "TAP THE CENTRE OF EACH CROSSHAIR", C_SOFT, 1);
+  char n[16];
+  snprintf(n, sizeof n, "%d / %d", s.calStep < CAL_POINTS ? s.calStep + 1 : CAL_POINTS, CAL_POINTS);
+  g.textCenter(160, 132, n, C_SOFT, 1);
+  g.textCenter(160, 150, "BOOT KEY CANCELS", C_DIM, 1);
+  for (int i = 0; i < CAL_POINTS; i++) {
+    int x = CAL_TARGETS[i][0], y = CAL_TARGETS[i][1];
+    if (i < s.calStep) {                                  // done: small tick mark
+      g.fillRect(x - 1, y - 1, 3, 3, C_DIM);
+    } else if (i == s.calStep) {                          // current target
+      bool on = (s.ms / 300) & 1;
+      g.circle(x, y, 9, on ? C_BRIGHT : C_MID);
+      g.hline(x - 15, y, 31, C_MID);
+      g.vline(x, y - 15, 31, C_MID);
+      g.fillRect(x - 1, y - 1, 3, 3, C_BRIGHT);
+    }
+  }
+}
+
 // ----------------------------------------------------------------
 
 void drawScreen(Canvas& g, const UiState& s) {
@@ -484,6 +512,7 @@ void drawScreen(Canvas& g, const UiState& s) {
     case SCR_COMMS:  drawComms(g, s); break;
     case SCR_TOOLS:  drawTools(g, s); break;
     case SCR_FILES:  drawFiles(g, s); break;
+    case SCR_TOUCHCAL: drawTouchCal(g, s); break;
   }
 }
 
@@ -493,7 +522,7 @@ void drawScreen(Canvas& g, const UiState& s) {
 
 UiHit uiHitTest(const UiState& s, int x, int y) {
   const UiHit none = {HIT_NONE, 0};
-  if (s.screen == SCR_BOOT) return none;
+  if (s.screen == SCR_BOOT || s.screen == SCR_TOUCHCAL) return none;   // calibration reads raw points
   if (s.screen == SCR_HOME) {                       // menu items at y = 54 + i*30, bars 136 px wide
     if (x < 160 && y >= 46 && y < 46 + MENU_COUNT * 30) return {HIT_ITEM, (y - 46) / 30};
     return none;

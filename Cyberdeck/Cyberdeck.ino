@@ -41,8 +41,10 @@
 enum Ev { EV_UP, EV_DOWN, EV_LEFT, EV_RIGHT, EV_CLICK, EV_KEY };
 static void handle(Ev e, char key = 0);
 
+static void openScreen(Screen next);
+
 #if HAS_TOUCH
-enum TouchKind : uint8_t { TE_TAP, TE_STEP, TE_BACK, TE_BUTTON };
+enum TouchKind : uint8_t { TE_TAP, TE_STEP, TE_BACK, TE_BUTTON, TE_CAL };
 struct TouchEv { TouchKind kind; int16_t x, y, rawX, rawY; };   // TE_STEP: x = +1 (down) / -1 (up)
 #endif
 
@@ -543,6 +545,19 @@ static bool i2cReadReg(uint8_t addr, uint8_t reg, uint8_t* out, uint8_t n) {
   return true;
 }
 
+// Raw panel point -> screen pixel, as an affine map: sx = a*rx + b*ry + c, sy = d*rx + e*ry + f.
+// Starts from the boards.h swap/flip guess; touch calibration replaces it and stores it in prefs ("tcal").
+static float tcal[6];
+
+static void touchDefaultCal() {
+  float a = 0, b = 0, c = 0, d = 0, e = 0, f = 0;
+  if (TOUCH_SWAP_XY) { b = 1; d = 1; } else { a = 1; e = 1; }
+  if (TOUCH_FLIP_X) { a = -a; b = -b; c = SCREEN_W - 1; }
+  if (TOUCH_FLIP_Y) { d = -d; e = -e; f = SCREEN_H - 1; }
+  const float t[6] = {a, b, c, d, e, f};
+  memcpy(tcal, t, sizeof tcal);
+}
+
 // One touch point in screen coordinates. false = no finger (or the chip didn't answer).
 static bool touchRead(int& x, int& y, int& rx, int& ry) {
   uint8_t d[5];
@@ -551,11 +566,10 @@ static bool touchRead(int& x, int& y, int& rx, int& ry) {
   if (n == 0 || n > 2) return false;
   rx = ((d[1] & 0x0F) << 8) | d[2];
   ry = ((d[3] & 0x0F) << 8) | d[4];
-  int sx = TOUCH_SWAP_XY ? ry : rx, sy = TOUCH_SWAP_XY ? rx : ry;
-  if (TOUCH_FLIP_X) sx = SCREEN_W - 1 - sx;
-  if (TOUCH_FLIP_Y) sy = SCREEN_H - 1 - sy;
-  x = constrain(sx, 0, SCREEN_W - 1);
-  y = constrain(sy, 0, SCREEN_H - 1);
+  float sx = tcal[0] * rx + tcal[1] * ry + tcal[2];
+  float sy = tcal[3] * rx + tcal[4] * ry + tcal[5];
+  x = constrain((int)lroundf(sx), 0, SCREEN_W - 1);
+  y = constrain((int)lroundf(sy), 0, SCREEN_H - 1);
   return true;
 }
 
@@ -567,8 +581,9 @@ static void sendTouch(TouchKind k, int x = 0, int y = 0, int rx = 0, int ry = 0)
 static void inputTask(void*) {
   bool was = false, dragged = false;
   int x0 = 0, y0 = 0, rx0 = 0, ry0 = 0, lx = 0, ly = 0, acc = 0;
-  bool btnDown = false;
+  bool btnDown = false, btnLong = false;
   uint8_t btnStable = 0;
+  uint32_t btnAt = 0;
   for (;;) {
     int x, y, rx, ry;
     bool down = touchRead(x, y, rx, ry);
@@ -587,10 +602,17 @@ static void inputTask(void*) {
     }
     was = down;
 
-    // BOOT key: act on press after 30 ms stable
+    // BOOT key, debounced (30 ms stable): short press = BUTTON_EVENT, hold 2 s = touch calibration
     bool b = digitalRead(PIN_BUTTON) == LOW;
-    if (b != btnDown) { if (++btnStable >= 3) { btnDown = b; btnStable = 0; if (b) sendTouch(TE_BUTTON); } }
-    else btnStable = 0;
+    if (b != btnDown) {
+      if (++btnStable >= 3) {
+        btnDown = b;
+        btnStable = 0;
+        if (b) { btnAt = millis(); btnLong = false; }
+        else if (!btnLong) sendTouch(TE_BUTTON);
+      }
+    } else btnStable = 0;
+    if (btnDown && !btnLong && millis() - btnAt >= 2000) { btnLong = true; sendTouch(TE_CAL); }
 
     vTaskDelay(pdMS_TO_TICKS(10));
   }
@@ -642,14 +664,88 @@ static void onTap(const TouchEv& ev) {
   }
 }
 
+// ---- touch calibration: tap CAL_POINTS crosshairs, least-squares fit an affine map, keep it if it agrees
+static int16_t calRaw[CAL_POINTS][2];
+
+static void startCalibration() {
+  S.calStep = 0;
+  S.calFailed = false;
+  openScreen(SCR_TOUCHCAL);
+  LOG("[cal] start\n");
+}
+
+// Fit out = p*rx + q*ry + r for one screen axis (0 = x, 1 = y) via the 3x3 normal equations.
+static bool fitAxis(int axis, float out[3]) {
+  double m[3][4] = {};
+  for (int i = 0; i < CAL_POINTS; i++) {
+    const double v[3] = {(double)calRaw[i][0], (double)calRaw[i][1], 1.0};
+    const double t = CAL_TARGETS[i][axis];
+    for (int r = 0; r < 3; r++) {
+      for (int c = 0; c < 3; c++) m[r][c] += v[r] * v[c];
+      m[r][3] += v[r] * t;
+    }
+  }
+  for (int c = 0; c < 3; c++) {                       // Gauss-Jordan, partial pivoting
+    int p = c;
+    for (int r = c + 1; r < 3; r++) if (fabs(m[r][c]) > fabs(m[p][c])) p = r;
+    if (fabs(m[p][c]) < 1e-9) return false;           // all taps in one spot / on one line
+    for (int k = 0; k < 4; k++) std::swap(m[c][k], m[p][k]);
+    for (int r = 0; r < 3; r++) {
+      if (r == c) continue;
+      double f = m[r][c] / m[c][c];
+      for (int k = c; k < 4; k++) m[r][k] -= f * m[c][k];
+    }
+  }
+  for (int r = 0; r < 3; r++) out[r] = (float)(m[r][3] / m[r][r]);
+  return true;
+}
+
+static void calTap(int rx, int ry) {
+  calRaw[S.calStep][0] = rx;
+  calRaw[S.calStep][1] = ry;
+  LOG("[cal] point %d target=(%d,%d) raw=(%d,%d)\n", S.calStep + 1, CAL_TARGETS[S.calStep][0],
+      CAL_TARGETS[S.calStep][1], rx, ry);
+  dirty = true;
+  if (++S.calStep < CAL_POINTS) return;
+
+  float t[6];
+  bool ok = fitAxis(0, t) && fitAxis(1, t + 3);
+  float worst = 0;
+  for (int i = 0; ok && i < CAL_POINTS; i++) {
+    float ex = t[0] * calRaw[i][0] + t[1] * calRaw[i][1] + t[2] - CAL_TARGETS[i][0];
+    float ey = t[3] * calRaw[i][0] + t[4] * calRaw[i][1] + t[5] - CAL_TARGETS[i][1];
+    worst = std::max(worst, sqrtf(ex * ex + ey * ey));
+  }
+  LOG("[cal] fit sx=%.4f*rx %+.4f*ry %+.1f   sy=%.4f*rx %+.4f*ry %+.1f   worst error %.1f px\n",
+      t[0], t[1], t[2], t[3], t[4], t[5], worst);
+  if (!ok || worst > 20) {                            // a mis-tap; the 4th point checks the other 3
+    LOG("[cal] rejected, asking again\n");
+    S.calStep = 0;
+    S.calFailed = true;
+    return;
+  }
+  memcpy(tcal, t, sizeof tcal);
+  prefs.putBytes("tcal", tcal, sizeof tcal);
+  LOG("[cal] saved\n");
+  S.calFailed = false;
+  openScreen(SCR_HOME);
+}
+
 static void pollTouch() {
   TouchEv ev;
   while (xQueueReceive(touchQ, &ev, 0) == pdTRUE) {
+    if (ev.kind == TE_CAL) { startCalibration(); continue; }
+    if (S.screen == SCR_TOUCHCAL) {
+      if (ev.kind == TE_TAP) calTap(ev.rawX, ev.rawY);
+      else if (ev.kind == TE_BUTTON) { LOG("[cal] cancelled\n"); openScreen(SCR_HOME); }
+      continue;
+    }
     switch (ev.kind) {
       case TE_TAP:    onTap(ev); break;
       case TE_STEP:   handle(ev.x > 0 ? EV_DOWN : EV_UP); break;
       case TE_BACK:   LOG("[touch] swipe back\n"); handle(EV_LEFT); break;
       case TE_BUTTON: LOG("[btn] BOOT\n"); handle(BUTTON_EVENT); break;
+      default: break;
     }
   }
 }
@@ -849,6 +945,11 @@ void setup() {
 #if HAS_TOUCH
   i = bootStep("TOUCH");
   S.inputOk = initTouch();
+  touchDefaultCal();
+  bool haveCal = prefs.isKey("tcal") && prefs.getBytes("tcal", tcal, sizeof tcal) == sizeof tcal;
+  if (haveCal) LOG("[cal] loaded sx=%.4f*rx %+.4f*ry %+.1f   sy=%.4f*rx %+.4f*ry %+.1f\n",
+                   tcal[0], tcal[1], tcal[2], tcal[3], tcal[4], tcal[5]);
+  else { touchDefaultCal(); LOG("[cal] none stored, using the boards.h default\n"); }
   bootDone(i, S.inputOk ? 1 : 2);
 #endif
 
@@ -881,6 +982,9 @@ void setup() {
   delay(350);
   S.screen = SCR_HOME;
   dirty = true;
+#if HAS_TOUCH
+  if (S.inputOk && !haveCal) startCalibration();   // first boot on this board: line touch up with the screen
+#endif
 }
 
 void loop() {
@@ -915,6 +1019,7 @@ void loop() {
   if (S.screen == SCR_HOME) interval = 90;                      // twinkling stars, beacon
   else if (S.screen == SCR_SCAN && S.scanning) interval = 50;   // radar sweep
   else if (S.screen == SCR_COMMS) interval = 250;               // cursor blink
+  else if (S.screen == SCR_TOUCHCAL) interval = 150;            // blinking crosshair
   if (dirty || millis() - lastFrame >= interval) render();
   delay(2);
 }
